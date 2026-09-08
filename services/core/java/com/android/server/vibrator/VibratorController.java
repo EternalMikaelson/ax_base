@@ -48,6 +48,17 @@ final class VibratorController implements HalVibrator {
     private static final String TAG = "VibratorController";
 
     private final Object mLock = new Object();
+    // Timestamp (SystemClock.elapsedRealtime) of the last TICK primitive actually dispatched to
+    // RichTap, and of the first TICK in the current unbroken burst. Used only to coalesce
+    // rapid-fire drag-generated ticks (text selection, slider drags) before they reach the
+    // vendor HAL - see on(..., PrimitiveSegment[]). Guarded by mLock. Does NOT change anything
+    // about what gets reported back to VibrationThread (every dispatch still returns 0, same as
+    // the confirmed-working baseline) - this only reduces how many raw-pattern calls are made in
+    // the first place.
+    @GuardedBy("mLock")
+    private long mLastTickDispatchUptimeMs = 0;
+    @GuardedBy("mLock")
+    private long mTickBurstStartUptimeMs = 0;
 
     @GuardedBy("mLock")
     private final NativeWrapper mNativeWrapper;
@@ -400,7 +411,54 @@ final class VibratorController implements HalVibrator {
                         int baseStrength = RichTapVibrationEffect.getInnerEffectStrength(VibrationEffect.EFFECT_STRENGTH_LIGHT);
                         int strength = (int) (baseStrength * scale);
                         if (strength > 10) {
-                            mRichTapService.richTapVibratorOnRawPattern(pattern, strength, 0);
+                            boolean shouldDispatch = true;
+                            if (mappedEffectId == VibrationEffect.EFFECT_TICK) {
+                                // Coalesce rapid-fire drag-generated ticks (text selection,
+                                // slider drags can fire one per pointer-move event, dozens per
+                                // second) before they reach the vendor HAL's own queue. This is
+                                // the only change from the confirmed-working baseline - dispatch
+                                // itself, and what's returned below, are otherwise identical.
+                                // CLICK/THUD (button-triggered, not drag-generated) are never
+                                // rate-limited.
+                                //
+                                // 70ms base gap: logcat on this device shows the native
+                                // AacRichTapPerformer draining its own internal queue at a fixed
+                                // ~65-66ms per item ("total num" counting down at that cadence),
+                                // independent of anything sent from Java. 70ms keeps Java's
+                                // dispatch rate at or under that drain rate during normal use, so
+                                // the queue doesn't grow in the first place.
+                                //
+                                // Adaptive widening past 1s: a 70ms gap only prevents backlog from
+                                // GROWING - it doesn't help drain backlog that already built up
+                                // (e.g. during an unusually long/fast continuous selection, gap
+                                // timing jitter can still let a few extra items queue). Widening
+                                // to 100ms once a burst has run over a second forces dispatch
+                                // rate below the drain rate for a while, so any existing backlog
+                                // actually clears instead of just holding steady.
+                                long now = android.os.SystemClock.elapsedRealtime();
+                                // Track how long this burst of ticks has been running
+                                // uninterrupted. A gap over 300ms means the previous gesture
+                                // ended and this is effectively a new one.
+                                if (now - mLastTickDispatchUptimeMs > 300) {
+                                    mTickBurstStartUptimeMs = now;
+                                }
+                                long burstDurationMs = now - mTickBurstStartUptimeMs;
+                                // Base gap (70ms) matches the native queue's own drain rate, so a
+                                // short/normal selection never builds backlog in the first place.
+                                // For a burst running longer than ~1s straight, widen the gap
+                                // further so dispatch rate actually falls BELOW the drain rate for
+                                // a while, letting any backlog that did build up during the first
+                                // second actually clear instead of just holding steady.
+                                long requiredGapMs = (burstDurationMs > 1000) ? 100 : 70;
+                                if (now - mLastTickDispatchUptimeMs < requiredGapMs) {
+                                    shouldDispatch = false;
+                                } else {
+                                    mLastTickDispatchUptimeMs = now;
+                                }
+                            }
+                            if (shouldDispatch) {
+                                mRichTapService.richTapVibratorOnRawPattern(pattern, strength, 0);
+                            }
                         }
                     }
                     return 0;
